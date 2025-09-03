@@ -90,6 +90,13 @@ class HabTile(QgsMapTool):
         # Check if habitat layer already exists
         for layer in QgsProject.instance().mapLayers().values():
             if layer.name() == "Habitat_Classifications":
+                field_name = "box_size_pixel"
+                if field_name not in [f.name() for f in layer.fields()]:
+                    layer.startEditing()
+                    from qgis.core import QgsField
+                    layer.addAttribute(QgsField(field_name, QVariant.Int))
+                    layer.updateFields()
+                    layer.commitChanges()
                 self.habitat_layer = layer
                 return
         self.add_habitat_types(self.habitat_types, self.color_types)
@@ -721,3 +728,4 @@ def export_to_yolo(layer, output_dir):
             ])
     with open(class_file, 'w') as f:
         f.write('\n'.join(habitat_types))
+
