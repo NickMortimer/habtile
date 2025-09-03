@@ -32,5 +32,5 @@ def classFactory(iface):  # pylint: disable=invalid-name
     :type iface: QgsInterface
     """
     #
-    from .habtile import habtile
-    return habtile(iface)
+    from .habtile import HabitatClassificationPlugin
+    return HabitatClassificationPlugin(iface)
