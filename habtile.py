@@ -88,6 +88,7 @@ class HabTile(QgsMapTool):
     def setup_habitat_layer(self):
         """Create or get the habitat classification layer"""
         # Check if habitat layer already exists
+        from qgis.core import QgsField
         for layer in QgsProject.instance().mapLayers().values():
             if layer.name() == "Habitat_Classifications":
                 field_name = "box_size_pixel"
@@ -221,7 +222,6 @@ class HabTile(QgsMapTool):
                 box_setup)
 
 
-
         # self.habitat_layer.setEditorWidgetSetup(
         #     self.habitat_layer.fields().indexFromName('habitat_second'),
         #     habitat_setup
@@ -323,23 +323,29 @@ class HabTile(QgsMapTool):
         
         # Generate tile ID
         tile_id = f"{raster_name}_{int(point.x())}_{int(point.y())}_{datetime.now().strftime('%H%M%S')}"
-        
-        # Set attributes
-        feature.setAttributes([
-            self.last_habitat_main_1,# Use last selected habitat type
-            self.last_habitat_main_2,# Use last selected habitat type
-            self.last_habitat_main_3,# Use last selected habitat type
-            self.last_habitat_main_4,# Use last selected habitat type
-            '',# notes
-            raster_name,  # source_raster
-            pixel_size,  # pixel_size
-            tile_id,  # tile_id
-            box_size_m,  # box_size_m
-            self.box_size_pixel,
-            point.x(),  # center_x
-            point.y(),  # center_y
-              
-        ])
+        fid_idx = self.habitat_layer.fields().indexFromName('fid')
+
+        attrs = {
+            "habitat_main_1": self.last_habitat_main_1,
+            "habitat_main_2": self.last_habitat_main_2,
+            "habitat_main_3": self.last_habitat_main_3,
+            "habitat_main_4": self.last_habitat_main_4,
+            "notes": "",
+            "source_raster": raster_name,
+            "pixel_size": pixel_size,
+            "tile_id": tile_id,
+            "box_size_m": box_size_m,
+            "box_size_pixel": self.box_size_pixel,
+            "center_x": point.x(),
+            "center_y": point.y(),
+        }
+
+        # Apply attributes to feature
+        feature.setAttributes([None] * len(self.habitat_layer.fields()))  # init with correct length
+        for field_name, value in attrs.items():
+            idx = self.habitat_layer.fields().indexFromName(field_name)
+            if idx != -1:
+                feature.setAttribute(idx, value)
         
 
             # Start editing
@@ -355,6 +361,28 @@ class HabTile(QgsMapTool):
             self.habitat_layer.addFeature(feature)
             
             # Create and configure the feature form
+
+            # List of fields you want on the form
+            allowed_fields = [
+                "habitat_1",
+                "habitat_2",
+                "habitat_3",
+                "habitat_4",
+                "notes",
+                "source_raster",
+                "pixel_size",
+                "tile_id",
+                "box_size_m",
+                "box_size_pixel",
+                "center_x",
+                "center_y"
+            ]
+
+            for idx, field in enumerate(self.habitat_layer.fields()):
+                if field.name() in allowed_fields:
+                    continue
+                # Hide all other fields
+                self.habitat_layer.setEditorWidgetSetup(idx, QgsEditorWidgetSetup("Hidden", {}))
             dialog = iface.getFeatureForm(self.habitat_layer, feature)
             
             # Connect to form response
