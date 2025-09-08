@@ -326,10 +326,10 @@ class HabTile(QgsMapTool):
         fid_idx = self.habitat_layer.fields().indexFromName('fid')
 
         attrs = {
-            "habitat_main_1": self.last_habitat_main_1,
-            "habitat_main_2": self.last_habitat_main_2,
-            "habitat_main_3": self.last_habitat_main_3,
-            "habitat_main_4": self.last_habitat_main_4,
+            "habitat_1": self.last_habitat_main_1,
+            "habitat_2": self.last_habitat_main_2,
+            "habitat_3": self.last_habitat_main_3,
+            "habitat_4": self.last_habitat_main_4,
             "notes": "",
             "source_raster": raster_name,
             "pixel_size": pixel_size,
