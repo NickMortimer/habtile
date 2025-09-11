@@ -4,8 +4,8 @@ from qgis.PyQt.QtGui import QColor, QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox, QInputDialog, QFileDialog, QDialoghic Habitat Classification Tool for QGIS
 Creates 256x256 pixel habitat classification boxes with YOLO export capability
 """
-from qgis.core import QgsMessageLog
-from qgis.PyQt.QtCore import QVariant, QDateTime, Qt
+from qgis.core import QgsMessageLog, QgsVectorFileWriter
+from qgis.PyQt.QtCore import QVariant, QDateTime, Qt, QTimer
 from qgis.PyQt.QtGui import QColor, QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox, QInputDialog, QFileDialog, QDialog
 from qgis.core import (
@@ -21,6 +21,7 @@ import processing
 from qgis.gui import QgsMapTool
 from qgis.utils import iface
 from qgis.core import Qgis
+from pathlib import Path
 import os
 import csv
 from datetime import datetime
@@ -30,10 +31,10 @@ def log_debug(msg):
 class HabTile(QgsMapTool):
     """Custom map tool for habitat classification"""
     
-    def __init__(self, canvas):
+    def __init__(self, canvas, habitat_layer=None):
         super().__init__(canvas)
         self.canvas = canvas
-        self.habitat_layer = None
+        self.habitat_layer = habitat_layer
         self.habitat_types_layer = None
         self.last_habitat_main_1 = None
         self.last_habitat_main_2 = None
@@ -43,28 +44,137 @@ class HabTile(QgsMapTool):
         self.box_size_pixel = 256
         self.output_dir = QgsProject.instance().homePath()  # Default output directory
         self.last_confidence = 'High'  # Default initial confidence
-        self.habitat_types = [
+        self.habitat_types = []
+        self.color_types=[]
+        self.habitat_types,self.habitat_colors = self.load_or_create_habitat_types()
+
+        
+    
+    def setup_habitat_layer(self):
+        self.habitat_layer = None
+        pixel_size, raster_name, raster_crs,raster_layer = self.get_selected_raster_info()
+        if not pixel_size or not raster_name or not raster_crs or not raster_crs.isValid():
+            QMessageBox.warning(
+                None,
+                "No Raster Selected",
+                "Please select a valid automosaic raster layer first."
+            )
+            return
+        layer_name = f"Habitat_{raster_name}"
+        required_fields = [
+            ("habitat_1", QVariant.String, 40),
+            ("habitat_2", QVariant.String, 40),
+            ("habitat_3", QVariant.String, 40),
+            ("habitat_4", QVariant.String, 40),
+            ("notes", QVariant.String, 255),
+            ("source_raster", QVariant.String, 100),
+            ("pixel_size", QVariant.Double, None),
+            ("tile_id", QVariant.String, 100),
+            ("box_size_m", QVariant.Double, None),
+            ("box_size_pixel", QVariant.Int, None),
+            ("center_x", QVariant.Double, None),
+            ("center_y", QVariant.Double, None)
+        ]
+
+        # Try to find an existing layer
+        for layer in QgsProject.instance().mapLayers().values():
+            if layer.name() == layer_name and layer.type() == QgsMapLayer.VectorLayer:
+                # Add missing fields if needed
+                missing = []
+                for name, qtype, length in required_fields:
+                    if name not in [f.name() for f in layer.fields()]:
+                        missing.append((name, qtype, length))
+                if missing:
+                    layer.startEditing()
+                    for name, qtype, length in missing:
+                        if length:
+                            layer.addAttribute(QgsField(name, qtype, len=length))
+                        else:
+                            layer.addAttribute(QgsField(name, qtype))
+                    layer.updateFields()
+                    layer.commitChanges()
+                self.habitat_layer = layer
+                self.set_symbology()
+                self.configure_attribute_form()
+                return
+        # If habitat layer not found, prompt to create
+        reply = QMessageBox.question(
+            None,
+            "Habitat Layer Missing",
+            "The habitat layer has been deleted or removed from the project.\n\n"
+            "Would you like to recreate it?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            # If not found, create new layer
+            layer_path = f"Polygon?crs={raster_crs.authid()}"
+            self.habitat_layer = QgsVectorLayer(layer_path, layer_name, "memory")
+            fields = []
+            for name, qtype, length in required_fields:
+                if length:
+                    fields.append(QgsField(name, qtype, len=length))
+                else:
+                    fields.append(QgsField(name, qtype))
+            self.habitat_layer.dataProvider().addAttributes(fields)
+            self.habitat_layer.updateFields()
+            self.habitat_layer.setCrs(QgsCoordinateReferenceSystem(raster_crs))
+            self.set_symbology()
+            self.configure_attribute_form()
+            QgsProject.instance().addMapLayer(self.habitat_layer)
+            self.habitat_layer_saved = False
+            # restore the raster layer as active after the event loop updates
+            def restore_active_layer():
+                iface.setActiveLayer(raster_layer)
+            QTimer.singleShot(0, restore_active_layer)
+
+
+
+    def set_symbology(self):
+        # Setup the categorized renderer
+        categories = []
+        # Build a dict mapping habitat name to color
+        for habitat_type,color_hex in zip(self.habitat_types, self.habitat_colors):
+            QgsMessageLog.logMessage(f"Categories:  {habitat_type} {color_hex}", level=Qgis.Info)
+            symbol = QgsFillSymbol.createSimple({'color': color_hex})
+            for layer in symbol.symbolLayers():
+                color = layer.color()
+                color.setAlphaF(0.5)
+                layer.setColor(color)
+            category = QgsRendererCategory(habitat_type, symbol, habitat_type)
+            categories.append(category)
+        ##print out categories to log for debugging
+        QgsMessageLog.logMessage(f"Categories: {categories} {self.habitat_types} {self.habitat_colors}", level=Qgis.Info)
+        renderer = QgsCategorizedSymbolRenderer('habitat_1', categories)
+        self.habitat_layer.setRenderer(renderer)
+
+
+    def load_or_create_habitat_types(self):
+        import os
+        from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox
+        project_dir = QgsProject.instance().homePath()
+        default_csv = os.path.join(project_dir, "habitat_types.csv")
+        habitat_types = [
                 "Seagrass_High-density strappy ", 
                 "Seagrass_Medium-density strappy", 
                 "Seagrass_low-density strappy",
                 "Sand",
                 "Sand patches_large ",
                 "Sand patches_small ",
-                "Coral_High-density",
+                "Coral_ High-density",
                 "Coral_Medium-density",
-                "Coral_low-density",
-                "Coral rubble",
-                "Coral heads",
-                "Rocky shoreline",
-                "Sandy shoreline",
-                "Trees on land",
+                "Coral-low-density",
+                "Coral-rubble",
+                "Coral-heads",
+                "Rocky-shoreline",
+                "Sandy-shoreline",
+                "Trees-on-land",
                 "Mangroves",
-                "Macroalgae: calcified",
+                "Macroalgae-calcified",
                 "Deep water",
                 "",
 
         ]
-        self.color_types=["#08F704",
+        color_types = ["#08F704",
                           "#37FF8E",
                           "#7FFEB6",
                           "#FCF803",
@@ -83,130 +193,33 @@ class HabTile(QgsMapTool):
                           "#01081D",
                           "#6E4541",
                           ]
-        self.setup_habitat_layer()
+
+        # Try to load default CSV
+        if os.path.exists(default_csv):
+            habitat_types = []
+            color_types = []
+            with open(default_csv, newline='') as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    habitat_types.append(row['habitat_name'])
+                    color_types.append(row.get('cat_color', '#FFFFFF'))
+        else:
+            with open(default_csv, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['habitat_name', 'cat_color'])
+                for habitat, color in zip(habitat_types, color_types):
+                    writer.writerow([habitat, color])
+        return habitat_types, color_types
     
-    def setup_habitat_layer(self):
-        """Create or get the habitat classification layer"""
-        # Check if habitat layer already exists
-        from qgis.core import QgsField
-        for layer in QgsProject.instance().mapLayers().values():
-            if layer.name() == "Habitat_Classifications":
-                field_name = "box_size_pixel"
-                if field_name not in [f.name() for f in layer.fields()]:
-                    layer.startEditing()
-                    from qgis.core import QgsField
-                    layer.addAttribute(QgsField(field_name, QVariant.Int))
-                    layer.updateFields()
-                    layer.commitChanges()
-                self.habitat_layer = layer
-                return
-        self.add_habitat_types(self.habitat_types, self.color_types)
-        # Create new habitat layer
-        pixel_size, raster_name, raster_crs = self.get_selected_raster_info()
-        layer_path = f"Polygon?crs={raster_crs}"  # Adjust CRS as needed
-        self.habitat_layer = QgsVectorLayer(layer_path, "Habitat_Classifications", "memory")
-        
-        # Add fields
-        fields = [
-            QgsField("habitat_1", QVariant.String, len=40),
-            QgsField("habitat_2", QVariant.String, len=40),
-            QgsField("habitat_3", QVariant.String, len=40),
-            QgsField("habitat_4", QVariant.String, len=40),
-            QgsField("notes", QVariant.String, len=255),
-            QgsField("source_raster", QVariant.String, len=100),
-            QgsField("pixel_size", QVariant.Double),
-            QgsField("tile_id", QVariant.String, len=100),
-            QgsField("box_size_m", QVariant.Double),
-            QgsField("box_size_pixel", QVariant.Int),
-            QgsField("center_x", QVariant.Double),
-            QgsField("center_y", QVariant.Double)
-        ]
-        
-        self.habitat_layer.dataProvider().addAttributes(fields)
-        self.habitat_layer.updateFields()
-        # Set fields to invisible
-        # for field in self.habitat_layer.fields():
-        #     name = field.name()
-        #     if name not in ["habitat", "notes"]:
-        #         index = self.habitat_layer.fields().indexFromName(name)
-        #         self.habitat_layer.setEditorWidgetSetup(index, QgsEditorWidgetSetup('Hidden', {}))
-        
-        # Configure attribute form
-        self.configure_attribute_form()
-        
-        # Setup the categorized renderer
-        categories = []
-        # Build a dict mapping habitat name to color
-        color_map = {feat['habitat_name']: feat['cat_color'] for feat in self.habitat_types_layer.getFeatures()}
-
-        #unique_values = self.habitat_types_layer.uniqueValues(self.habitat_types_layer.fields().indexFromName('habitat_name'))
-
-        for habitat_type,color_hex in zip(self.habitat_types, self.color_types):
-            symbol = QgsFillSymbol.createSimple({'color': color_hex})
-            for layer in symbol.symbolLayers():
-                color = layer.color()
-                color.setAlphaF(0.5)
-                layer.setColor(color)
-            category = QgsRendererCategory(habitat_type, symbol, habitat_type)
-            categories.append(category)
-
-        renderer = QgsCategorizedSymbolRenderer('habitat_1', categories)
-        self.habitat_layer.setRenderer(renderer)
-        # Add to project
-        QgsProject.instance().addMapLayer(self.habitat_layer)
-        
-    def add_habitat_types(self, initial_types=["Coral", "Sand", "Seagrass"],color_types=["#FF6F61","#F4E1B6","#2E8B57"]):
-        # 1. Create the in-memory lookup layer
-        for layer in QgsProject.instance().mapLayers().values():
-            if layer.name() == "habitat_lookup":
-                self.habitat_types_layer = layer
-                return
-        habitat_types_layer = QgsVectorLayer("None", "habitat_lookup", "memory")
-        # Add fields
-        fields = [
-            QgsField("habitat_name", QVariant.String, len=40),
-            QgsField("cat_color", QVariant.String, len=10)
-        ]
-        
-        habitat_types_layer.dataProvider().addAttributes(fields)
-        habitat_types_layer.updateFields()
-
-        
-        # habitat_types_layer.updateExtents()
-        habitat_types_layer.startEditing()
-        fields = habitat_types_layer.fields()
-        log_debug(f"Fields: {[field.name() for field in fields]}")
-
-        for name, hex_color in zip(initial_types, color_types):
-            feat = QgsFeature()
-            feat.setFields(fields, True)  # bind fields with init=true
-            feat.setAttribute(fields.indexOf("habitat_name"), name)
-            feat.setAttribute(fields.indexOf("cat_color"), hex_color)
-            habitat_types_layer.addFeature(feat)
-        habitat_types_layer.commitChanges()
-        # Add the lookup layer to the project so it's usable by ValueRelation
-        QgsProject.instance().addMapLayer(habitat_types_layer)
-        self.habitat_types_layer = habitat_types_layer
 
     
     def configure_attribute_form(self):
         """Configure the attribute form for quick habitat selection"""
         form_config = self.habitat_layer.editFormConfig()
-        # Set up habitat types with editable combo box
-        habitat_config = {
-            'Layer': self.habitat_types_layer.id(),
-            'Key': 'habitat_name',
-            'Value': 'habitat_name',
-            'AllowNull': True,
-            'AllowMulti': False,
-            'AllowAddFeatures': True,
-            'UseCompleter': True,
-            'OrderByValue': True
-        }
-
         config = {
             'map': {val: val for val in self.habitat_types}  # display → stored
         }
+        QgsMessageLog.logMessage(f"COMBO: {config} ", level=Qgis.Info)
 
         habitat_setup = QgsEditorWidgetSetup('ValueMap', config)
         size_setup = {'map':{'64x64':64,'128x128':128,'256x256':256}}
@@ -215,47 +228,12 @@ class HabTile(QgsMapTool):
         for field in ['habitat_1', 'habitat_2', 'habitat_3', 'habitat_4']:
             self.habitat_layer.setEditorWidgetSetup(
                 self.habitat_layer.fields().indexFromName(field),
-                habitat_setup)
-                
+                habitat_setup
+            )
         self.habitat_layer.setEditorWidgetSetup(
             self.habitat_layer.fields().indexFromName('box_size_pixel'),
-                box_setup)
-
-
-        # self.habitat_layer.setEditorWidgetSetup(
-        #     self.habitat_layer.fields().indexFromName('habitat_second'),
-        #     habitat_setup
-        # )
-        
-        # self.habitat_layer.setEditorWidgetSetup(
-        #     self.habitat_layer.fields().indexFromName('habitat_main'),
-        #     habitat_setup
-        # )
-        # self.habitat_layer.setEditorWidgetSetup(
-        #     self.habitat_layer.fields().indexFromName('habitat_second'),
-        #     habitat_setup
-        # )
-        
-        # Set up confidence as dropdown
-        confidence_config = {
-            'map': [
-                {'High': 'High'},
-                {'Medium': 'Medium'},
-                {'Low': 'Low'}
-            ]
-        }
-        # confidence_setup = QgsEditorWidgetSetup('ValueMap', confidence_config)
-        # self.habitat_layer.setEditorWidgetSetup(
-        #     self.habitat_layer.fields().indexFromName('confidence'),
-        #     confidence_setup
-        # )
-        
-        # Set default value for date_time
-        # self.habitat_layer.setDefaultValueExpression(
-        #     self.habitat_layer.fields().indexFromName('date_time'),
-        #     'now()'
-        # )
-        
+            box_setup
+        )
         self.habitat_layer.setEditFormConfig(form_config)
     
     def get_selected_raster_info(self):
@@ -265,10 +243,73 @@ class HabTile(QgsMapTool):
             pixel_size = layer.rasterUnitsPerPixelX()
             raster_name = layer.name()
             raster_crs = layer.crs()
-            return pixel_size, raster_name, raster_crs
-        return None, None, None
+            return pixel_size, raster_name, raster_crs, layer
+        return None, None, None, None
     
+
+    def suggest_save_path(self,layer):
+        """Suggest a filename in the project directory (or home if not saved)."""
+        safe_name = layer.name().replace(" ", "_").lower()
+        date_tag = datetime.now().strftime("%Y%m%d")
+        filename = f"{safe_name}_{date_tag}.gpkg"
+
+        project_file = QgsProject.instance().fileName()
+        if project_file:
+            default_dir = Path(project_file).parent
+        else:
+            default_dir = Path.home()
+
+        return default_dir / filename
+
+    def save_scratch_layer_with_dialog(self,layer):
+        if not layer.isValid():
+            raise ValueError("Layer is not valid")
+        """Open a dialog box to save a scratch layer to GeoPackage."""
+        default_path = self.suggest_save_path(layer)
+
+        # Open file save dialog with default path filled in
+        file_path, _ = QFileDialog.getSaveFileName(
+            None,
+            "Save Scratch Layer",
+            str(default_path),
+            "GeoPackage (*.gpkg)"
+        )
+        if not file_path:  # user cancelled
+            return None
+        
+        if not os.path.isdir(os.path.dirname(file_path)):
+            QMessageBox.critical(None, "Save Error", f"Directory does not exist: {os.path.dirname(file_path)}")
+            return None
+        if not os.access(os.path.dirname(file_path), os.W_OK):
+            QMessageBox.critical(None, "Save Error", f"Cannot write to directory: {os.path.dirname(file_path)}")
+            return None
+        import processing
+        params = {
+            'INPUT': layer,
+            'OUTPUT': file_path,
+            'LAYER_NAME': layer.name(),
+            'OVERWRITE': True
+        }
+        try:
+            # After saving with processing.run("native:savefeatures", params)
+            result = processing.run("native:savefeatures", params)
+            saved_layer_path = result['OUTPUT']
+            saved_layer = QgsVectorLayer(saved_layer_path, layer.name(), "ogr")
+            if saved_layer.isValid():
+                saved_layer.setName(layer.name())  # Set to original name
+                QgsProject.instance().addMapLayer(saved_layer)
+                QgsProject.instance().removeMapLayer(layer.id())
+                self.habitat_layer = saved_layer
+        except Exception as e:
+            QMessageBox.critical(None, "Save Error", f"Error saving layer:\n{str(e)}")
+            return None
+        return file_path
+
+
+
+
     def canvasPressEvent(self, event):
+
         """Handle mouse click on canvas"""
         # Get click point in map coordinates
         point = self.toMapCoordinates(event.pos())
@@ -276,173 +317,180 @@ class HabTile(QgsMapTool):
         # Check if Ctrl key is pressed
         modifiers = event.modifiers()
         is_ctrl_click = bool(modifiers & Qt.ControlModifier)
-        
-        # Get raster info
-        pixel_size, raster_name, raster_crs = self.get_selected_raster_info()
-        
-        if not pixel_size or not raster_name:
-            QMessageBox.warning(
-                None, 
-                "No Raster Selected", 
-                "Please select an automosaic raster layer first."
+        pixel_size, raster_name, raster_crs, raster_layer = self.get_selected_raster_info()  
+        self.setup_habitat_layer()
+        if self.habitat_layer: 
+            # Transform point to raster's CRS for accurate size calculation
+            transform = QgsCoordinateTransform(
+                self.canvas.mapSettings().destinationCrs(),
+                raster_crs,
+                QgsProject.instance()
             )
-            return
-        
-        # Transform point to raster's CRS for accurate size calculation
-        transform = QgsCoordinateTransform(
-            self.canvas.mapSettings().destinationCrs(),
-            raster_crs,
-            QgsProject.instance()
-        )
-        transformed_point = transform.transform(point)
-        
-        # Calculate 256x256 pixel box size in raster units
-        box_size_m = self.box_size_pixel * pixel_size
-        half_box = box_size_m / 2
-        
-        # Create rectangle geometry in raster CRS
-        rect = QgsRectangle(
-            transformed_point.x() - half_box,
-            transformed_point.y() - half_box,
-            transformed_point.x() + half_box,
-            transformed_point.y() + half_box
-        )
-        geometry = QgsGeometry.fromRect(rect)
-        
-        # Transform geometry back to map CRS
-        transform_back = QgsCoordinateTransform(
-            raster_crs,
-            self.canvas.mapSettings().destinationCrs(),
-            QgsProject.instance()
-        )
-        geometry.transform(transform_back)
-        
-        # Create feature
-        feature = QgsFeature()
-        feature.setGeometry(geometry)
-        
-        # Generate tile ID
-        tile_id = f"{raster_name}_{int(point.x())}_{int(point.y())}_{datetime.now().strftime('%H%M%S')}"
-        fid_idx = self.habitat_layer.fields().indexFromName('fid')
-
-        attrs = {
-            "habitat_1": self.last_habitat_main_1,
-            "habitat_2": self.last_habitat_main_2,
-            "habitat_3": self.last_habitat_main_3,
-            "habitat_4": self.last_habitat_main_4,
-            "notes": "",
-            "source_raster": raster_name,
-            "pixel_size": pixel_size,
-            "tile_id": tile_id,
-            "box_size_m": box_size_m,
-            "box_size_pixel": self.box_size_pixel,
-            "center_x": point.x(),
-            "center_y": point.y(),
-        }
-
-        # Apply attributes to feature
-        feature.setAttributes([None] * len(self.habitat_layer.fields()))  # init with correct length
-        for field_name, value in attrs.items():
-            idx = self.habitat_layer.fields().indexFromName(field_name)
-            if idx != -1:
-                feature.setAttribute(idx, value)
-        
-
-            # Start editing
-        self.habitat_layer.startEditing()
-
-        if is_ctrl_click and self.last_habitat_main_1:
-            # Quick add using last values without showing form
-            self.habitat_layer.addFeature(feature)
-            self.habitat_layer.commitChanges()
-            self.canvas.refresh()
-        else:
-            # Add feature and show form
-            self.habitat_layer.addFeature(feature)
+            transformed_point = transform.transform(point)
             
-            # Create and configure the feature form
-
-            # List of fields you want on the form
-            allowed_fields = [
-                "habitat_1",
-                "habitat_2",
-                "habitat_3",
-                "habitat_4",
-                "notes",
-                "source_raster",
-                "pixel_size",
-                "tile_id",
-                "box_size_m",
-                "box_size_pixel",
-                "center_x",
-                "center_y"
-            ]
-
-            for idx, field in enumerate(self.habitat_layer.fields()):
-                if field.name() in allowed_fields:
-                    continue
-                # Hide all other fields
-                self.habitat_layer.setEditorWidgetSetup(idx, QgsEditorWidgetSetup("Hidden", {}))
-            dialog = iface.getFeatureForm(self.habitat_layer, feature)
+            # Calculate 256x256 pixel box size in raster units
+            box_size_m = self.box_size_pixel * pixel_size
+            half_box = box_size_m / 2
             
-            # Connect to form response
-            if dialog.exec_() == QDialog.Accepted:
-                # Get the updated feature
-                saved_feature = self.habitat_layer.getFeature(feature.id())
-                
-                # Update last used values
-                self.last_habitat_main_1 = saved_feature["habitat_1"]
-                self.last_habitat_main_2 = saved_feature["habitat_2"]
-                self.last_habitat_main_3 = saved_feature["habitat_3"]
-                self.last_habitat_main_4 = saved_feature["habitat_4"]
-                if (self.box_size_pixel != saved_feature["box_size_pixel"]):
-                    self.box_size_pixel = saved_feature["box_size_pixel"]
-                    # Calculate 256x256 pixel box size in raster units
-                    box_size_m = self.box_size_pixel * pixel_size
-                    half_box = box_size_m / 2
-                    
-                    # Create rectangle geometry in raster CRS
-                    rect = QgsRectangle(
-                        transformed_point.x() - half_box,
-                        transformed_point.y() - half_box,
-                        transformed_point.x() + half_box,
-                        transformed_point.y() + half_box
-                    )
-                    geometry = QgsGeometry.fromRect(rect)
-                    
-                    # Transform geometry back to map CRS
-                    transform_back = QgsCoordinateTransform(
-                        raster_crs,
-                        self.canvas.mapSettings().destinationCrs(),
-                        QgsProject.instance()
-                    )
-                    geometry.transform(transform_back)
-                    saved_feature.setGeometry(geometry)
-                        # Update the feature in the layer
-                    self.habitat_layer.startEditing()
-                    self.habitat_layer.updateFeature(saved_feature)
-                    # # If new habitat types were entered, add them to the list
-                # if saved_feature["habitat"] and saved_feature["habitat"] not in self.habitat_types:
-                #     self.habitat_types.append(saved_feature["habitat"])
-                #     self.configure_attribute_form()  # Refresh the form configuration
-                
-                
+            # Create rectangle geometry in raster CRS
+            rect = QgsRectangle(
+                transformed_point.x() - half_box,
+                transformed_point.y() - half_box,
+                transformed_point.x() + half_box,
+                transformed_point.y() + half_box
+            )
+            geometry = QgsGeometry.fromRect(rect)
+            
+            # Transform geometry back to map CRS
+            transform_back = QgsCoordinateTransform(
+                raster_crs,
+                self.canvas.mapSettings().destinationCrs(),
+                QgsProject.instance()
+            )
+            geometry.transform(transform_back)
+            
+            # Create feature
+            feature = QgsFeature()
+            feature.setGeometry(geometry)
+            
+            # Generate tile ID
+            tile_id = f"{raster_name}_{int(point.x())}_{int(point.y())}_{datetime.now().strftime('%H%M%S')}"
+
+            fid_idx = self.habitat_layer.fields().indexFromName('fid')
+
+            attrs = {
+                "habitat_1": self.last_habitat_main_1,
+                "habitat_2": self.last_habitat_main_2,
+                "habitat_3": self.last_habitat_main_3,
+                "habitat_4": self.last_habitat_main_4,
+                "notes": "",
+                "source_raster": raster_name,
+                "pixel_size": pixel_size,
+                "tile_id": tile_id,
+                "box_size_m": box_size_m,
+                "box_size_pixel": self.box_size_pixel,
+                "center_x": point.x(),
+                "center_y": point.y(),
+            }
+
+            # Apply attributes to feature
+            feature.setAttributes([None] * len(self.habitat_layer.fields()))  # init with correct length
+            for field_name, value in attrs.items():
+                idx = self.habitat_layer.fields().indexFromName(field_name)
+                if idx != -1:
+                    feature.setAttribute(idx, value)
+            
+
+                # Start editing
+            self.habitat_layer.startEditing()
+
+            if is_ctrl_click and self.last_habitat_main_1:
+                # Quick add using last values without showing form
+                self.habitat_layer.addFeature(feature)
                 self.habitat_layer.commitChanges()
+                self.canvas.refresh()
             else:
-                # Form was cancelled, roll back the changes
-                self.habitat_layer.rollBack()
-            
+                # Add feature and show form
+                self.habitat_layer.addFeature(feature)
+                
+                # Create and configure the feature form
+
+                # List of fields you want on the form
+                allowed_fields = [
+                    "habitat_1",
+                    "habitat_2",
+                    "habitat_3",
+                    "habitat_4",
+                    "notes",
+                    "source_raster",
+                    "pixel_size",
+                    "tile_id",
+                    "box_size_m",
+                    "box_size_pixel",
+                    "center_x",
+                    "center_y"
+                ]
+
+                for idx, field in enumerate(self.habitat_layer.fields()):
+                    if field.name() in allowed_fields:
+                        continue
+                    # Hide all other fields
+                    self.habitat_layer.setEditorWidgetSetup(idx, QgsEditorWidgetSetup("Hidden", {}))
+                dialog = iface.getFeatureForm(self.habitat_layer, feature)
+
+                # Add a label showing the layer name at the top of the dialog
+                from qgis.PyQt.QtWidgets import QLabel, QVBoxLayout
+                layer_label = QLabel(f"Saving to layer: <b>{self.habitat_layer.name()}</b>")
+                layout = dialog.layout()
+                if layout:
+                    layout.addWidget(layer_label, 0, 0)
+                
+                # Connect to form response
+                if dialog.exec_() == QDialog.Accepted:
+                    # Get the updated feature
+                    saved_feature = self.habitat_layer.getFeature(feature.id())
+                    
+                    # Update last used values
+                    self.last_habitat_main_1 = saved_feature["habitat_1"]
+                    self.last_habitat_main_2 = saved_feature["habitat_2"]
+                    self.last_habitat_main_3 = saved_feature["habitat_3"]
+                    self.last_habitat_main_4 = saved_feature["habitat_4"]
+                    if (self.box_size_pixel != saved_feature["box_size_pixel"]):
+                        self.box_size_pixel = saved_feature["box_size_pixel"]
+                        # Calculate 256x256 pixel box size in raster units
+                        box_size_m = self.box_size_pixel * pixel_size
+                        half_box = box_size_m / 2
+                        
+                        # Create rectangle geometry in raster CRS
+                        rect = QgsRectangle(
+                            transformed_point.x() - half_box,
+                            transformed_point.y() - half_box,
+                            transformed_point.x() + half_box,
+                            transformed_point.y() + half_box
+                        )
+                        geometry = QgsGeometry.fromRect(rect)
+                        
+                        # Transform geometry back to map CRS
+                        transform_back = QgsCoordinateTransform(
+                            raster_crs,
+                            self.canvas.mapSettings().destinationCrs(),
+                            QgsProject.instance()
+                        )
+                        geometry.transform(transform_back)
+                        saved_feature.setGeometry(geometry)
+                            # Update the feature in the layer
+                        self.habitat_layer.startEditing()
+                        self.habitat_layer.updateFeature(saved_feature)
+                        # # If new habitat types were entered, add them to the list
+                    # if saved_feature["habitat"] and saved_feature["habitat"] not in self.habitat_types:
+                    #     self.habitat_types.append(saved_feature["habitat"])
+                    #     self.configure_attribute_form()  # Refresh the form configuration
+                    
+                    
+                    self.habitat_layer.commitChanges()
+                    self.canvas.refresh()
+                    if self.habitat_layer.providerType() == "memory" and self.habitat_layer.featureCount() !=0:
+                        def save_layer():
+                            self.save_scratch_layer_with_dialog(self.habitat_layer)
+                            self.habitat_layer_saved = True
+                        QTimer.singleShot(0, save_layer)
+                else:
+                    # Form was cancelled, roll back the changes
+                    self.habitat_layer.rollBack()
+                self.canvas.refresh()
+                
+                
             self.canvas.refresh()
-        self.canvas.refresh()
         
 
 class HabitatClassificationPlugin:
     def __init__(self, iface):
         self.iface = iface
         self.actions = []
-        self.menu = '&HabTile'  # menu name used when adding actions
+        self.menu = '&HabTile'
         self.tool = None
-        self.toolbar_button = None  # track toolbar widget so it can be removed on unload
+        self.selected_habitat_layer = None  # Store selected layer if tool not yet created
+        self.toolbar_button = None
 
     def initGui(self):
         """Create action(s) and add to toolbar/menu"""
@@ -451,6 +499,12 @@ class HabitatClassificationPlugin:
         action.setObjectName('habtile_action')
         action.setToolTip('HabTile — create 256x256 habitat classification tiles')
         action.triggered.connect(self.run)  # your existing run method
+        self.select_layer_action = QAction("Select Habitat Layer", self.iface.mainWindow())
+        self.select_layer_action.setToolTip("Choose which habitat layer to use")
+        self.select_layer_action.triggered.connect(self.select_habitat_layer)
+        self.iface.addPluginToMenu(self.menu, self.select_layer_action)
+        self.actions.append(self.select_layer_action)
+
 
         # Add the QAction to QGIS toolbar and menu (keeps expected behaviour)
         self.iface.addToolBarIcon(action)
@@ -524,6 +578,20 @@ class HabitatClassificationPlugin:
         #           self.iface.removeDockWidget(self.dock)
         #           self.dock = None
 
+    def select_habitat_layer(self):
+        dlg = HabitatLayerSelector()
+        if dlg.exec_() == QDialog.Accepted:
+            selected = dlg.selected_layer()
+            if selected:
+                self.selected_habitat_layer = selected
+                if self.tool:
+                    self.tool.habitat_layer = selected
+                    self.tool.set_symbology()
+                    self.tool.configure_attribute_form()
+                QMessageBox.information(None, "Layer Selected", f"Habitat layer set to: {selected.name()}")
+            else:
+                QMessageBox.warning(None, "No Layer", "No habitat layer selected.")
+
     def run_export(self):
         """Run the export dialog"""
         if not self.tool or not self.tool.habitat_layer:
@@ -559,9 +627,12 @@ class HabitatClassificationPlugin:
     def run(self):
         """Run the tool"""
         if not self.tool:
-            self.tool = HabTile(iface.mapCanvas())
+            self.tool = HabTile(self.iface.mapCanvas(), self.selected_habitat_layer)
+            if self.tool.habitat_layer:
+                self.tool.set_symbology()
+                self.tool.configure_attribute_form()
         
-        iface.mapCanvas().setMapTool(self.tool)
+        self.iface.mapCanvas().setMapTool(self.tool)
         
         QMessageBox.information(
             None,
@@ -701,7 +772,7 @@ def export_to_yolo(layer, output_dir):
         habitat_type = "; ".join(habs)
         
         # if habitat_type is not in habitat_types: add it to the set
-        raster_name = feature["source_ras"]
+        raster_name = feature["source_raster"]
         tile_id = feature["tile_id"]
         bbox = feature.geometry().boundingBox()
         # Find the raster layer
@@ -757,3 +828,48 @@ def export_to_yolo(layer, output_dir):
     with open(class_file, 'w') as f:
         f.write('\n'.join(habitat_types))
 
+
+
+
+from qgis.PyQt.QtWidgets import QDialog, QVBoxLayout, QComboBox, QPushButton, QLabel
+
+class HabitatLayerSelector(QDialog):
+    REQUIRED_FIELDS = [
+        "habitat_1",
+        "habitat_2",
+        "habitat_3",
+        "habitat_4",
+        "notes",
+        "source_raster",
+        "pixel_size",
+        "tile_id",
+        "box_size_m",
+        "box_size_pixel",
+        "center_x",
+        "center_y"
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Habitat Layer")
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel("Choose a habitat layer:"))
+        self.combo = QComboBox()
+        self.layer_map = {}
+        for layer in QgsProject.instance().mapLayers().values():
+            if (
+                layer.type() == QgsMapLayer.VectorLayer
+                and layer.geometryType() == QgsWkbTypes.PolygonGeometry
+                and all(field in layer.fields().names() for field in self.REQUIRED_FIELDS)
+            ):
+                self.combo.addItem(layer.name())
+                self.layer_map[layer.name()] = layer
+        layout.addWidget(self.combo)
+        btn = QPushButton("OK")
+        btn.clicked.connect(self.accept)
+        layout.addWidget(btn)
+        self.setLayout(layout)
+
+    def selected_layer(self):
+        name = self.combo.currentText()
+        return self.layer_map.get(name, None)
