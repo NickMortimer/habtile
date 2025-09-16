@@ -60,7 +60,7 @@ class HabTile(QgsMapTool):
                 "Please select a valid automosaic raster layer first."
             )
             return
-        layer_name = f"Habitat_{raster_name}"
+        layer_name = f"Habitat_{raster_name}".lower()
         required_fields = [
             ("habitat_1", QVariant.String, 40),
             ("habitat_2", QVariant.String, 40),
@@ -78,7 +78,7 @@ class HabTile(QgsMapTool):
 
         # Try to find an existing layer
         for layer in QgsProject.instance().mapLayers().values():
-            if layer.name() == layer_name and layer.type() == QgsMapLayer.VectorLayer:
+            if layer.name().startswith(layer_name) and layer.type() == QgsMapLayer.VectorLayer:
                 # Add missing fields if needed
                 missing = []
                 for name, qtype, length in required_fields:
@@ -287,19 +287,37 @@ class HabTile(QgsMapTool):
         params = {
             'INPUT': layer,
             'OUTPUT': file_path,
-            'LAYER_NAME': layer.name(),
+            #'LAYER_NAME': layer.name(),
             'OVERWRITE': True
         }
         try:
+            
             # After saving with processing.run("native:savefeatures", params)
+            # Hold the renderer from the memory layer
+            renderer = layer.renderer().clone()
             result = processing.run("native:savefeatures", params)
+
+
+
             saved_layer_path = result['OUTPUT']
-            saved_layer = QgsVectorLayer(saved_layer_path, layer.name(), "ogr")
+            # Export symbology to QML
+            qml_path = saved_layer_path.replace(".gpkg", ".qml")
+            layer.saveNamedStyle(qml_path)
+
+
+            saved_layer = QgsVectorLayer(saved_layer_path, '', "ogr")
+            saved_layer.setRenderer(renderer)
             if saved_layer.isValid():
                 saved_layer.setName(layer.name())  # Set to original name
                 QgsProject.instance().addMapLayer(saved_layer)
                 QgsProject.instance().removeMapLayer(layer.id())
                 self.habitat_layer = saved_layer
+                self.set_symbology()
+                # Save style to GeoPackage
+                try:
+                    saved_layer.saveNamedStyle(file_path, "gpkg")
+                except Exception as e:
+                    QgsMessageLog.logMessage(f"Could not save style: {e}", level=Qgis.Warning)
         except Exception as e:
             QMessageBox.critical(None, "Save Error", f"Error saving layer:\n{str(e)}")
             return None
